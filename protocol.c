@@ -998,7 +998,11 @@ enet_protocol_handle_verify_connect (ENetHost * host, ENetEvent * event, ENetPee
 static int
 enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
 {
-    ENetProtocolHeader * header;
+    enet_uint8 usingNewPacket = host -> usingNewPacket && host -> address.port != 0;
+    size_t protocolHeaderSize = usingNewPacket ? sizeof (ENetProtocolHeaderUbisoft) : sizeof (ENetProtocolHeader);
+
+    ENetProtocolHeader * header = NULL;
+    ENetProtocolHeaderUbisoft * ubisoftHeader = NULL;
     ENetProtocol * command;
     ENetPeer * peer;
     enet_uint8 * currentData;
@@ -1006,17 +1010,32 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
     enet_uint16 peerID, flags;
     enet_uint8 sessionID;
 
-    if (host -> receivedDataLength < (size_t) & ((ENetProtocolHeader *) 0) -> sentTime)
-      return 0;
+    if (usingNewPacket)
+    {
+      if (host -> receivedDataLength < (size_t) & ((ENetProtocolHeader *) 0) -> sentTime)
+        return 0;
 
-    header = (ENetProtocolHeader *) host -> receivedData;
+      ubisoftHeader = (ENetProtocolHeaderUbisoft *) host -> receivedData;
+      peerID = ENET_NET_TO_HOST_16 (ubisoftHeader -> peerID);
+    }
+    else
+    {
+      if (host -> receivedDataLength < (size_t) & ((ENetProtocolHeaderUbisoft *) 0) -> sentTime)
+        return 0;
+      
+      header = (ENetProtocolHeader *) host -> receivedData;
+      peerID = ENET_NET_TO_HOST_16 (header -> peerID);
+    }
 
-    peerID = ENET_NET_TO_HOST_16 (header -> peerID);
     sessionID = (peerID & ENET_PROTOCOL_HEADER_SESSION_MASK) >> ENET_PROTOCOL_HEADER_SESSION_SHIFT;
     flags = peerID & ENET_PROTOCOL_HEADER_FLAG_MASK;
     peerID &= ~ (ENET_PROTOCOL_HEADER_FLAG_MASK | ENET_PROTOCOL_HEADER_SESSION_MASK);
 
-    headerSize = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME ? sizeof (ENetProtocolHeader) : (size_t) & ((ENetProtocolHeader *) 0) -> sentTime);
+    if (usingNewPacket)
+      headerSize = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME ? sizeof (ENetProtocolHeaderUbisoft) : (size_t) & ((ENetProtocolHeaderUbisoft *) 0) -> sentTime);
+    else
+      headerSize = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME ? sizeof (ENetProtocolHeader) : (size_t) & ((ENetProtocolHeader *) 0) -> sentTime);
+
     if (host -> checksum != NULL)
       headerSize += sizeof (enet_uint32);
 
@@ -1053,7 +1072,10 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
         if (originalSize <= 0 || originalSize > sizeof (host -> packetData [1]) - headerSize)
           return 0;
 
-        memcpy (host -> packetData [1], header, headerSize);
+        if (usingNewPacket)
+          memcpy (host -> packetData [1], ubisoftHeader, headerSize);
+        else
+          memcpy (host -> packetData [1], header, headerSize);
         host -> receivedData = host -> packetData [1];
         host -> receivedDataLength = headerSize + originalSize;
     }
@@ -1117,7 +1139,12 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
        case ENET_PROTOCOL_COMMAND_CONNECT:
           if (peer != NULL)
             goto commandError;
-          peer = enet_protocol_handle_connect (host, header, command);
+
+          if (usingNewPacket)
+            peer = enet_protocol_handle_connect (host, (ENetProtocolHeader *) (ubisoftHeader + sizeof(ubisoftHeader -> integrity)), command);
+          else
+            peer = enet_protocol_handle_connect (host, header, command);
+
           if (peer == NULL)
             goto commandError;
           break;
@@ -1184,7 +1211,10 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
            if (! (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME))
              break;
 
-           sentTime = ENET_NET_TO_HOST_16 (header -> sentTime);
+           if (usingNewPacket)
+             sentTime = ENET_NET_TO_HOST_16 (ubisoftHeader -> sentTime);
+           else
+             sentTime = ENET_NET_TO_HOST_16 (header -> sentTime);
 
            switch (peer -> state)
            {
@@ -1237,10 +1267,36 @@ enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
        if (receivedLength == 0)
          return 0;
 
-       host -> receivedData = host -> packetData [0];
-       host -> receivedDataLength = receivedLength;
-      
-       host -> totalReceivedData += receivedLength;
+       if (host -> enableLogging)
+       {
+          printf ("Received: ");
+          for (size_t i = 0; i < receivedLength; ++i)
+          {
+              printf ("%02x ", ( (enet_uint8 * ) buffer.data) [i]);
+          }
+          printf ("\n");
+       }
+
+       if (host -> socks5Socket != ENET_SOCKET_NULL)
+       {
+          ENetSocks5UDP * replyHeader = (ENetSocks5UDP *) host -> packetData[0];
+
+          if (replyHeader -> addressType != ENET_SOCKS5_ADDRESS_IPV4)
+            return -1;
+
+          host -> receivedData = host -> packetData[0] + sizeof (ENetSocks5UDP);
+          host -> receivedDataLength = receivedLength - sizeof (ENetSocks5UDP);
+          
+          host -> totalReceivedData += receivedLength - sizeof (ENetSocks5UDP);
+       }
+       else
+       {
+          host -> receivedData = host -> packetData[0];
+          host -> receivedDataLength = receivedLength;
+          
+          host -> totalReceivedData += receivedLength;
+       }
+       
        host -> totalReceivedPackets ++;
 
        if (host -> intercept != NULL)
@@ -1390,8 +1446,8 @@ enet_protocol_check_outgoing_commands (ENetHost * host, ENetPeer * peer)
     ENetBuffer * buffer = & host -> buffers [host -> bufferCount];
     ENetOutgoingCommand * outgoingCommand;
     ENetListIterator currentCommand;
-    ENetChannel *channel;
-    enet_uint16 reliableWindow;
+    ENetChannel *channel = NULL;
+    enet_uint16 reliableWindow = 0;
     size_t commandSize;
     int windowExceeded = 0, windowWrap = 0, canPing = 1;
 
@@ -1567,13 +1623,30 @@ enet_protocol_check_outgoing_commands (ENetHost * host, ENetPeer * peer)
 static int
 enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int checkForTimeouts)
 {
-    enet_uint8 headerData [sizeof (ENetProtocolHeader) + sizeof (enet_uint32)];
+    enet_uint8 usingNewPacket = host -> usingNewPacket && host -> address.port == 0;
+    size_t headerSize = usingNewPacket ? sizeof (ENetProtocolHeaderUbisoft) : sizeof (ENetProtocolHeader);
+
+    enet_uint8 headerData [sizeof(ENetSocks5UDP) + headerSize + sizeof (enet_uint32)];
+    memset(headerData, 0, sizeof(ENetSocks5UDP) + headerSize + sizeof (enet_uint32));
+
     ENetProtocolHeader * header = (ENetProtocolHeader *) headerData;
+    ENetProtocolHeaderUbisoft * ubisoftHeader = (ENetProtocolHeaderUbisoft *) headerData;
+
     ENetPeer * currentPeer;
     int sentLength;
     size_t shouldCompress = 0;
  
     host -> continueSending = 1;
+
+     if (usingNewPacket) {
+        enet_uint16 port = host -> socks5Socket != ENET_SOCKET_NULL ? host -> socks5TargetAddress.port : host -> peers -> address.port;
+        enet_uint16 rand1 = rand () % (port + 1);
+        enet_uint16 rand2 = rand ();
+
+        ubisoftHeader -> integrity[0] = ENET_HOST_TO_NET_16 (rand1);
+        ubisoftHeader -> integrity[1] = ENET_HOST_TO_NET_16 (rand1 ^ port);
+        ubisoftHeader -> integrity[2] = ENET_HOST_TO_NET_16 (rand2 & 0xF7DF | 0x9005);
+    }
 
     while (host -> continueSending)
     for (host -> continueSending = 0,
@@ -1588,7 +1661,7 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
         host -> headerFlags = 0;
         host -> commandCount = 0;
         host -> bufferCount = 1;
-        host -> packetSize = sizeof (ENetProtocolHeader);
+        host -> packetSize = headerSize;
 
         if (! enet_list_empty (& currentPeer -> acknowledgements))
           enet_protocol_send_acknowledgements (host, currentPeer);
@@ -1640,17 +1713,25 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
         host -> buffers -> data = headerData;
         if (host -> headerFlags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME)
         {
-            header -> sentTime = ENET_HOST_TO_NET_16 (host -> serviceTime & 0xFFFF);
+            if (usingNewPacket)
+              ubisoftHeader -> sentTime = ENET_HOST_TO_NET_16 (host -> serviceTime & 0xFFFF);
+            else
+              header -> sentTime = ENET_HOST_TO_NET_16 (host -> serviceTime & 0xFFFF);
 
-            host -> buffers -> dataLength = sizeof (ENetProtocolHeader);
+            host -> buffers -> dataLength = headerSize;
         }
         else
-          host -> buffers -> dataLength = (size_t) & ((ENetProtocolHeader *) 0) -> sentTime;
+        {
+            if (usingNewPacket)
+              host -> buffers -> dataLength = (size_t) & ((ENetProtocolHeaderUbisoft *) 0) -> sentTime;
+            else
+              host -> buffers -> dataLength = (size_t) & ((ENetProtocolHeader *) 0) -> sentTime;
+        }
 
         shouldCompress = 0;
         if (host -> compressor.context != NULL && host -> compressor.compress != NULL)
         {
-            size_t originalSize = host -> packetSize - sizeof(ENetProtocolHeader),
+            size_t originalSize = host -> packetSize - headerSize,
                    compressedSize = host -> compressor.compress (host -> compressor.context,
                                         & host -> buffers [1], host -> bufferCount - 1,
                                         originalSize,
@@ -1668,7 +1749,12 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
 
         if (currentPeer -> outgoingPeerID < ENET_PROTOCOL_MAXIMUM_PEER_ID)
           host -> headerFlags |= currentPeer -> outgoingSessionID << ENET_PROTOCOL_HEADER_SESSION_SHIFT;
-        header -> peerID = ENET_HOST_TO_NET_16 (currentPeer -> outgoingPeerID | host -> headerFlags);
+
+        if (usingNewPacket)
+          ubisoftHeader -> peerID = ENET_HOST_TO_NET_16 (currentPeer -> outgoingPeerID | host -> headerFlags);
+        else
+          header -> peerID = ENET_HOST_TO_NET_16 (currentPeer -> outgoingPeerID | host -> headerFlags);
+
         if (host -> checksum != NULL)
         {
             enet_uint32 * checksum = (enet_uint32 *) & headerData [host -> buffers -> dataLength];
@@ -1685,6 +1771,37 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
         }
 
         currentPeer -> lastSendTime = host -> serviceTime;
+
+        if (host -> socks5Socket != ENET_SOCKET_NULL)
+        {
+            memcpy(host -> buffers -> data + sizeof (ENetSocks5UDP), 
+                   host -> buffers -> data, 
+                  host -> buffers -> dataLength);
+
+            ENetSocks5UDP * request = (ENetSocks5UDP *) host -> buffers -> data;
+            request -> reserved = 0;
+            request -> fragment = 0;
+            request -> addressType = ENET_SOCKS5_ADDRESS_IPV4;
+            request -> addressHost = host -> socks5TargetAddress.host;
+            request -> addressPort = ENET_HOST_TO_NET_16 (host -> socks5TargetAddress.port);
+
+            host -> buffers -> dataLength += sizeof (ENetSocks5UDP);
+        }
+
+        if (host -> enableLogging)
+        {
+            printf("Sending: ");
+
+            for (size_t i = 0; i < host -> bufferCount; ++i)
+            {
+                for (size_t j = 0; j < host -> buffers[i].dataLength; ++j)
+                {
+                    printf("%02x ", ((enet_uint8 *)host -> buffers[i].data)[j]);
+                }
+            }
+
+            printf("\n");
+        }
 
         sentLength = enet_socket_send (host -> socket, & currentPeer -> address, host -> buffers, host -> bufferCount);
 
